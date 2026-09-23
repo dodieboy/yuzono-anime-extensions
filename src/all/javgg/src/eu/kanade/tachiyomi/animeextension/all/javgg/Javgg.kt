@@ -8,6 +8,7 @@ import aniyomi.lib.vidhideextractor.VidHideExtractor
 import aniyomi.lib.voeextractor.VoeExtractor
 import aniyomi.lib.youruploadextractor.YourUploadExtractor
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
+import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
@@ -21,6 +22,8 @@ import keiyoushi.utils.parallelCatchingFlatMapBlocking
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
+import java.text.SimpleDateFormat
+import java.util.Locale
 
 class Javgg :
     AnimeHttpLegacySource(),
@@ -65,13 +68,16 @@ class Javgg :
             "StreamHideVid",
             "TurboPlay",
         )
+        private val DATE_FORMATTER by lazy {
+            SimpleDateFormat("MMM. dd,yyyy", Locale.getDefault())
+        }
     }
 
     override fun animeDetailsParse(response: Response): SAnime {
         val document = response.asJsoup()
         val animeDetails = SAnime.create().apply {
             status = SAnime.COMPLETED
-            description = document.selectFirst("#cover")?.text()
+            description = document.select("#cover p").joinToString { it.text() }
         }
 
         document.select(".data .boxye2").forEach { element ->
@@ -107,20 +113,82 @@ class Javgg :
 
     override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/new-post/page/$page", headers)
 
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request = when {
-        query.isNotBlank() -> GET("$baseUrl/jav/page/$page?s=$query", headers)
-        else -> popularAnimeRequest(page)
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
+        // If a tag filter is selected (not "All"), prefer tag page over query
+        val tagSelect = filters.find { it is TagSelect } as? TagSelect
+        val selectedTag = tagSelect?.let { if (it.state == 0) "" else it.values[it.state] } ?: ""
+
+        val slugMap = mapOf(
+            "Chinese Subtitle" to "chinese-subtitle",
+            "English Subtitle" to "english-subtitle",
+            "HD Uncensored" to "hd-uncensored",
+            "Censored" to "censored",
+            "Decensored" to "decensored",
+            "Uncensored Leak" to "uncensored-leak",
+        )
+
+        if (selectedTag.isNotBlank()) {
+            val slug = slugMap[selectedTag]
+            if (!slug.isNullOrBlank()) return GET("$baseUrl/tag/$slug/page/$page/?view=today", headers)
+        }
+
+        return when {
+            query.isNotBlank() -> GET("$baseUrl/jav/page/$page?s=$query", headers)
+            else -> popularAnimeRequest(page)
+        }
     }
+
+    override fun getFilterList(): AnimeFilterList = AnimeFilterList(
+        TagSelect(),
+    )
+
+    private class TagSelect :
+        AnimeFilter.Select<String>(
+            "Tags",
+            arrayOf(
+                "All",
+                "Chinese Subtitle",
+                "English Subtitle",
+                "HD Uncensored",
+                "Censored",
+                "Decensored",
+                "Uncensored Leak",
+            ),
+        )
 
     override fun searchAnimeParse(response: Response): AnimesPage {
         val document = response.asJsoup()
-        val elements = document.select(".result-item article")
+        val elements = document.select(".result-item article").ifEmpty {
+            document.select("article[id*=post-]")
+        }
         val nextPage = document.select("#nextpagination").any()
         val animeList = elements.map { element ->
             SAnime.create().apply {
                 setUrlWithoutDomain(element.selectFirst("a")!!.attr("abs:href"))
-                title = element.selectFirst(".details .title")!!.text()
-                thumbnail_url = element.selectFirst(".image")?.getImageUrl()
+                title = element.selectFirst(".data h3 a")?.text()
+                    ?: element.selectFirst("h3 a")?.text()
+                    ?: element.selectFirst(".details .title")?.text()
+                    ?: element.selectFirst(".data h3")?.text()
+                    ?: ""
+                thumbnail_url = element.selectFirst(".poster img")?.let { img ->
+                    val lazySrc = img.attr("data-lazy-src")
+                    if (!lazySrc.isNullOrEmpty()) {
+                        lazySrc
+                    } else {
+                        img.attr("src").takeIf { !it.isNullOrEmpty() }
+                            ?: element.selectFirst(".image")?.getImageUrl()
+                            ?: element.selectFirst(".poster")?.getImageUrl()
+                    }
+                } ?: element.selectFirst(".image img")?.let { img ->
+                    val lazySrc = img.attr("data-lazy-src")
+                    if (!lazySrc.isNullOrEmpty()) {
+                        lazySrc
+                    } else {
+                        img.attr("src").takeIf { !it.isNullOrEmpty() }
+                            ?: element.selectFirst(".image")?.getImageUrl()
+                            ?: element.selectFirst(".poster")?.getImageUrl()
+                    }
+                }
             }
         }
         return AnimesPage(animeList, nextPage)
@@ -145,17 +213,29 @@ class Javgg :
 
     override fun episodeListParse(response: Response): List<SEpisode> {
         val document = response.asJsoup()
-        return if (document.select(".dooplay_player_option").any()) {
-            listOf(
-                SEpisode.create().apply {
-                    name = "Episode 1"
-                    episode_number = 1F
-                    setUrlWithoutDomain(document.location())
-                },
-            )
-        } else {
-            emptyList()
+        val ep = document.select(".dooplay_player_option")
+        if (!ep.any()) return emptyList()
+
+        val date = document.selectFirst(".extra span.date")?.text()?.parseDate() ?: 0L
+        val url = document.location()
+        val firstTitle = ep.lastOrNull()?.selectFirst("span.title")?.text()?.trim()
+        val partMatch = firstTitle?.let { Regex("Part\\s*(\\d+)", RegexOption.IGNORE_CASE).find(it) }
+        if (partMatch != null) {
+            val count = partMatch.groupValues.getOrNull(1)?.toIntOrNull() ?: 1
+            return (1..count).map { idx ->
+                episodeFromElement(url, idx).apply { date_upload = date }
+            }
         }
+        val template = ep.first() ?: return emptyList()
+        return listOf(episodeFromElement(url, 1).apply { date_upload = date })
+    }
+
+    private fun episodeFromElement(pageUrl: String, overrideNumber: Int? = null) = SEpisode.create().apply {
+        val num = overrideNumber?.toFloat() ?: 1F
+        episode_number = num
+        name = "Episode ${num.toInt()}"
+        val uniqueUrl = if (overrideNumber != null) "$pageUrl#${num.toInt()}" else pageUrl
+        setUrlWithoutDomain(uniqueUrl)
     }
 
     override fun videoListParse(response: Response): List<Video> {
@@ -205,7 +285,7 @@ class Javgg :
     }
 
     private fun org.jsoup.nodes.Element.getImageUrl(): String? {
-        val imageLinkRegex = """https?://\S+\.(jpg|png)""".toRegex()
+        val imageLinkRegex = """https?://\S+\.(jpg|png|webp)""".toRegex()
 
         for (link in this.select("[href], [src]")) {
             val href = link.attr("href")
@@ -268,4 +348,6 @@ class Javgg :
             }
         }.also(screen::addPreference)
     }
+    private fun String.parseDate(): Long = runCatching { DATE_FORMATTER.parse(this)?.time }
+        .getOrNull() ?: 0L
 }
