@@ -1,0 +1,8 @@
+ext {
+    extName = 'ChengguoDJ'
+    extClass = '.ChengguoDj'
+    extVersionCode = 1
+    isNsfw = true
+}
+
+apply plugin: "kei.plugins.extension.legacy"
