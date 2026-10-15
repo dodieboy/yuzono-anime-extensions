@@ -1,7 +1,7 @@
 ext {
     extName = 'HuangguoAI'
     extClass = '.HuangguoAI'
-    extVersionCode = 2
+    extVersionCode = 1
     isNsfw = true
 }
 
