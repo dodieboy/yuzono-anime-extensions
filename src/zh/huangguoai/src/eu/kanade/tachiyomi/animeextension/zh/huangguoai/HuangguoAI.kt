@@ -13,8 +13,20 @@ import keiyoushi.lib.dataimage.DataImageInterceptor
 import keiyoushi.utils.AnimeHttpLegacySource
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import okhttp3.Interceptor
+import okhttp3.MediaType
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.ResponseBody
+import okio.Buffer
+import okio.ForwardingSource
+import okio.Source
+import okio.buffer
+import okio.cipherSource
+import java.io.FilterInputStream
+import java.io.IOException
+import java.io.InputStream
+import java.security.GeneralSecurityException
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -55,19 +67,30 @@ class HuangguoAI : AnimeHttpLegacySource() {
         val document = response.asJsoup()
         return SAnime.create().apply {
             title = document.selectFirst("h1")?.text().orEmpty()
-            thumbnail_url = document.selectFirst(".hg-web-detail__poster img")?.let { image ->
-                image.attr("abs:data-src").ifBlank { image.attr("data-src") }
-            }?.let(::decryptImage).orEmpty().ifBlank { COVER_PLACEHOLDER }
             description = document.selectFirst("meta[name=description]")?.attr("content").orEmpty()
             genre = document.select(".hg-web-detail__hero a.hg-tag").joinToString { it.text() }
         }
     }
 
-    override fun episodeListParse(response: Response): List<SEpisode> = response.asJsoup().select("a[href*=/video/]").distinctBy { it.attr("href") }.mapIndexed { index, element ->
-        SEpisode.create().apply {
-            setUrlWithoutDomain(element.absUrl("href"))
-            name = element.text().ifBlank { "%02d".format(index + 1) }
-            episode_number = Regex("\\d+").find(name)?.value?.toFloatOrNull() ?: (index + 1).toFloat()
+    override fun episodeListParse(response: Response): List<SEpisode> {
+        val document = response.asJsoup()
+        val episodeLinks = document.select("a[data-ep-id][href*='/video/']").reversed()
+        val currentUrl = response.request.url.toString().takeIf { "/video/" in it }
+        val urls = buildList {
+            episodeLinks.forEach { element ->
+                add(element.absUrl("href") to element.text().ifBlank { "" })
+            }
+            if (currentUrl != null && none { it.first == currentUrl }) {
+                add(0, currentUrl to "01")
+            }
+        }.distinctBy { it.first }
+
+        return urls.mapIndexed { index, (url, label) ->
+            SEpisode.create().apply {
+                setUrlWithoutDomain(url)
+                name = label.ifBlank { "%02d".format(index + 1) }
+                episode_number = Regex("\\d+").find(name)?.value?.toFloatOrNull() ?: (index + 1).toFloat()
+            }
         }
     }
 
@@ -131,7 +154,7 @@ class HuangguoAI : AnimeHttpLegacySource() {
                     image.attr("abs:data-src").ifBlank { image.attr("data-src") }
                 }?.let(::decryptImage).orEmpty().ifBlank { COVER_PLACEHOLDER }
             }
-        }
+        }.distinctBy { it.url }
         return AnimesPage(items, document.select("a[title*=下一页]:not([disabled])").isNotEmpty())
     }
 }
