@@ -63,17 +63,19 @@ class M3u8ServerManager(
      *   [M3u8HttpServer.createLocalUrl] for why this is the root-cause fix
      *   for Cloudflare-fronted CDNs that 403 on null-Referer requests.
      * @param userAgent optional User-Agent to encode alongside the referer.
+     * @param customHeaders optional custom headers to forward on upstream requests.
      * @return Processed M3U8 content as a local URL string
      */
-    fun processM3u8Url(m3u8Url: String, referer: String? = null, userAgent: String? = null): String? = server?.createLocalUrl(m3u8Url, referer, userAgent)
+    fun processM3u8Url(m3u8Url: String, referer: String? = null, userAgent: String? = null, customHeaders: Map<String, String> = emptyMap()): String? = server?.createLocalUrl(m3u8Url, referer, userAgent, customHeaders)
 
     /**
      * Processes a segment through the server
      * @param segmentUrl Original segment URL
      * @param headers Optional headers to use for the request
+     * @param customHeaders Optional custom headers to forward on upstream requests
      * @return Processed segment data
      */
-    suspend fun processSegmentUrl(segmentUrl: String, headers: Map<String, String> = emptyMap()): ByteArray? = server?.processSegmentUrl(segmentUrl, headers)
+    suspend fun processSegmentUrl(segmentUrl: String, headers: Map<String, String> = emptyMap(), customHeaders: Map<String, String> = emptyMap()): ByteArray? = server?.processSegmentUrl(segmentUrl, headers, customHeaders = customHeaders)
 
     /**
      * Gets server information

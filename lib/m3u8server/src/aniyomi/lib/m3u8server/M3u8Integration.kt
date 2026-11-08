@@ -43,7 +43,11 @@ class M3u8Integration(
     private fun processM3u8Video(originalVideo: Video): Video {
         val referer = originalVideo.headers?.get("Referer")
         val userAgent = originalVideo.headers?.get("User-Agent")
-        val processedUrl = serverManager.processM3u8Url(originalVideo.videoUrl, referer, userAgent)
+        // Extract custom headers (excluding Referer and User-Agent which are handled separately)
+        val customHeaders = originalVideo.headers?.toMultimap()?.mapValues { (_, v) -> v.first() }?.let { map ->
+            map.filterKeys { it.lowercase() !in setOf("referer", "user-agent") }
+        } ?: emptyMap()
+        val processedUrl = serverManager.processM3u8Url(originalVideo.videoUrl, referer, userAgent, customHeaders)
         return Video(
             videoUrl = processedUrl ?: originalVideo.videoUrl,
             url = originalVideo.videoUrl,

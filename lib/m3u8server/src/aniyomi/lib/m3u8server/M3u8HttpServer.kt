@@ -5,6 +5,8 @@ import keiyoushi.utils.decodeHex
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
@@ -18,6 +20,7 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 import java.security.GeneralSecurityException
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
@@ -96,10 +99,21 @@ class M3u8HttpServer(
         val url = session.parameters["url"]?.first()
         val fallbackReferer = session.parameters["referer"]?.first()
         val fallbackUserAgent = session.parameters["useragent"]?.first()
+        val customHeadersJson = session.parameters["headers"]?.first()
+        val customHeaders = if (customHeadersJson?.isNotBlank() == true) {
+            try {
+                kotlinx.serialization.json.Json.decodeFromString<Map<String, String>>(customHeadersJson)
+            } catch (e: Exception) {
+                Log.w(tag, "Failed to parse custom headers JSON: ${e.message}")
+                emptyMap<String, String>()
+            }
+        } else {
+            emptyMap<String, String>()
+        }
         val headers = extractHeadersFromSession(session, fallbackReferer, fallbackUserAgent)
 
         Log.d(tag, "Processing M3U8 request for URL: $url")
-        Log.d(tag, "Headers: $headers")
+        Log.d(tag, "Headers: $headers, Custom headers: $customHeaders")
 
         if (url.isNullOrBlank()) {
             Log.w(tag, "Missing URL parameter in M3U8 request")
@@ -108,7 +122,7 @@ class M3u8HttpServer(
 
         return try {
             Log.d(tag, "Starting M3U8 processing for: $url")
-            val processedContent = runBlocking { processM3u8Content(url, headers) }
+            val processedContent = runBlocking { processM3u8Content(url, headers, customHeaders) }
             Log.d(tag, "M3U8 processing completed successfully, content length: ${processedContent.length}")
             newFixedLengthResponse(Status.OK, "application/vnd.apple.mpegurl", processedContent)
         } catch (e: UpstreamStatusException) {
@@ -126,10 +140,21 @@ class M3u8HttpServer(
         val iv = session.parameters["iv"]?.first()
         val fallbackReferer = session.parameters["referer"]?.first()
         val fallbackUserAgent = session.parameters["useragent"]?.first()
+        val customHeadersJson = session.parameters["headers"]?.first()
+        val customHeaders = if (customHeadersJson?.isNotBlank() == true) {
+            try {
+                kotlinx.serialization.json.Json.decodeFromString<Map<String, String>>(customHeadersJson)
+            } catch (e: Exception) {
+                Log.w(tag, "Failed to parse custom headers JSON: ${e.message}")
+                emptyMap<String, String>()
+            }
+        } else {
+            emptyMap<String, String>()
+        }
         val headers = extractHeadersFromSession(session, fallbackReferer, fallbackUserAgent)
 
         Log.d(tag, "Processing segment request for URL: $url (key=${keyUrl != null}, iv=${iv != null})")
-        Log.d(tag, "Headers: $headers")
+        Log.d(tag, "Headers: $headers, Custom headers: $customHeaders")
 
         if (url.isNullOrBlank()) {
             Log.w(tag, "Missing URL parameter in segment request")
@@ -140,7 +165,7 @@ class M3u8HttpServer(
         return try {
             Log.d(tag, "Starting segment processing for: $url (aes=$hasAes)")
             val segmentData = runBlocking {
-                processSegmentUrl(url, headers, keyUrl, iv)
+                processSegmentUrl(url, headers, keyUrl, iv, customHeaders)
             }
             Log.d(tag, "Segment processing completed successfully, data size: ${segmentData.size} bytes")
             val inputStream = ByteArrayInputStream(segmentData)
@@ -257,7 +282,7 @@ class M3u8HttpServer(
     /**
      * Process M3U8 content through the server
      */
-    private suspend fun processM3u8Content(url: String, headers: Map<String, String> = emptyMap()): String = withContext(Dispatchers.IO) {
+    private suspend fun processM3u8Content(url: String, headers: Map<String, String> = emptyMap(), customHeaders: Map<String, String> = emptyMap()): String = withContext(Dispatchers.IO) {
         try {
             Log.d(tag, "Fetching M3U8 content from: $url with headers: $headers")
             val m3u8Content = fetchM3u8Content(url, headers)
@@ -265,7 +290,7 @@ class M3u8HttpServer(
 
             val referer = headers["referer"]
             val userAgent = headers["user-agent"]
-            val modifiedContent = modifyM3u8Content(m3u8Content, url, port, referer, userAgent)
+            val modifiedContent = modifyM3u8Content(m3u8Content, url, port, referer, userAgent, customHeaders)
             Log.d(tag, "Modified M3U8 content length: ${modifiedContent.length}")
             Log.d(tag, "M3U8 processing completed successfully")
 
@@ -292,21 +317,25 @@ class M3u8HttpServer(
         headers: Map<String, String> = emptyMap(),
         keyUrl: String? = null,
         iv: String? = null,
+        customHeaders: Map<String, String> = emptyMap(),
     ): ByteArray = withContext(Dispatchers.IO) {
         try {
             Log.d(tag, "Fetching segment from: $url with headers: $headers (aes=${keyUrl != null})")
-            val rawSegment = fetchSegmentBytes(url, headers)
-            val plaintext = if (keyUrl != null && iv != null) {
-                val keyBytes = fetchSegmentBytes(keyUrl, headers)
-                decryptAes128Cbc(rawSegment, keyBytes, iv).also {
-                    Log.d(tag, "AES-128 decrypted segment: ${rawSegment.size} → ${it.size} bytes")
-                }
+            // Merge custom headers into headers for segment fetch
+            val mergedHeaders = headers + customHeaders
+            val rawSegment = fetchSegmentBytes(url, mergedHeaders)
+            if (keyUrl != null && iv != null) {
+                // AES-128: decrypt and return clean MPEG-TS (no junk stripping)
+                val keyBytes = fetchSegmentBytes(keyUrl, mergedHeaders)
+                val decrypted = decryptAes128Cbc(rawSegment, keyBytes, iv)
+                Log.d(tag, "AES-128 decrypted segment: ${rawSegment.size} → ${decrypted.size} bytes")
+                return@withContext decrypted
             } else {
-                rawSegment
+                // No AES: may have ChillX-style junk byte interleaving
+                val stripped = stripInterleavedJunk(rawSegment)
+                Log.d(tag, "Segment processing completed (no AES), final size: ${stripped.size} bytes")
+                return@withContext stripped
             }
-            val stripped = stripInterleavedJunk(plaintext)
-            Log.d(tag, "Segment processing completed, final size: ${stripped.size} bytes")
-            stripped
         } catch (e: UpstreamStatusException) {
             Log.w(tag, "Segment fetch upstream ${e.code} for $url")
             throw e
@@ -477,6 +506,7 @@ class M3u8HttpServer(
         m3u8Url: String,
         referer: String? = null,
         userAgent: String? = null,
+        customHeaders: Map<String, String> = emptyMap(),
     ): String {
         val sb = StringBuilder("http://localhost:$port/m3u8?url=")
             .append(URLEncoder.encode(m3u8Url, Charsets.UTF_8.name()))
@@ -485,6 +515,10 @@ class M3u8HttpServer(
         }
         if (!userAgent.isNullOrBlank()) {
             sb.append("&useragent=").append(URLEncoder.encode(userAgent, Charsets.UTF_8.name()))
+        }
+        if (customHeaders.isNotEmpty()) {
+            val json = JsonObject(customHeaders.entries.associate { it.key to it.value }.map { (k, v) -> k to kotlinx.serialization.json.JsonPrimitive(v) }.toMap())
+            sb.append("&headers=").append(URLEncoder.encode(json.toString(), StandardCharsets.UTF_8.name()))
         }
         return sb.toString()
     }
@@ -495,6 +529,7 @@ class M3u8HttpServer(
         serverPort: Int,
         referer: String? = null,
         userAgent: String? = null,
+        customHeaders: Map<String, String> = emptyMap(),
     ): String {
         Log.d(tag, "Modifying M3U8 content for server port: $serverPort (referer=${referer?.take(80) ?: "none"})")
         val lines = content.lines()
@@ -550,10 +585,10 @@ class M3u8HttpServer(
                         val encodedUrl = URLEncoder.encode(resolvedUrl, Charsets.UTF_8.name())
                         // Forward the caller's referer / UA to sub-playlists so
                         // the redirect chain keeps browser-fingerprint headers.
-                        modifiedLines.add(buildChildM3u8Url(serverPort, resolvedUrl, referer, userAgent))
+                        modifiedLines.add(buildChildM3u8Url(serverPort, resolvedUrl, referer, userAgent, customHeaders))
                     } else {
                         modifiedLines.add(
-                            createLocalSegmentUrl(serverPort, resolvedUrl, currentKey, referer, userAgent),
+                            createLocalSegmentUrl(serverPort, resolvedUrl, currentKey, referer, userAgent, customHeaders),
                         )
                         segmentCount++
                     }
@@ -571,6 +606,7 @@ class M3u8HttpServer(
         m3u8Url: String,
         referer: String?,
         userAgent: String?,
+        customHeaders: Map<String, String> = emptyMap(),
     ): String {
         val sb = StringBuilder("http://localhost:$serverPort/m3u8?url=")
             .append(URLEncoder.encode(m3u8Url, Charsets.UTF_8.name()))
@@ -579,6 +615,10 @@ class M3u8HttpServer(
         }
         if (!userAgent.isNullOrBlank()) {
             sb.append("&useragent=").append(URLEncoder.encode(userAgent, Charsets.UTF_8.name()))
+        }
+        if (customHeaders.isNotEmpty()) {
+            val json = JsonObject(customHeaders.entries.associate { it.key to it.value }.map { (k, v) -> k to kotlinx.serialization.json.JsonPrimitive(v) }.toMap())
+            sb.append("&headers=").append(URLEncoder.encode(json.toString(), StandardCharsets.UTF_8.name()))
         }
         return sb.toString()
     }
@@ -599,6 +639,7 @@ class M3u8HttpServer(
         key: HlsKey?,
         referer: String? = null,
         userAgent: String? = null,
+        customHeaders: Map<String, String> = emptyMap(),
     ): String {
         val encodedUrl = URLEncoder.encode(segmentUrl, Charsets.UTF_8.name())
         return buildString {
@@ -611,11 +652,16 @@ class M3u8HttpServer(
             }
             if (!referer.isNullOrBlank()) {
                 append("&referer=")
-                append(URLEncoder.encode(referer, Charsets.UTF_8.name()))
+                append(URLEncoder.encode(referer, StandardCharsets.UTF_8.name()))
             }
             if (!userAgent.isNullOrBlank()) {
                 append("&useragent=")
-                append(URLEncoder.encode(userAgent, Charsets.UTF_8.name()))
+                append(URLEncoder.encode(userAgent, StandardCharsets.UTF_8.name()))
+            }
+            if (customHeaders.isNotEmpty()) {
+                val json = JsonObject(customHeaders.entries.associate { it.key to it.value }.map { (k, v) -> k to kotlinx.serialization.json.JsonPrimitive(v) }.toMap())
+                append("&headers=")
+                append(URLEncoder.encode(json.toString(), StandardCharsets.UTF_8.name()))
             }
         }
     }

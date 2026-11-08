@@ -1,35 +1,32 @@
 package eu.kanade.tachiyomi.animeextension.zh.huangguoai
 
 import android.util.Base64
+import aniyomi.lib.m3u8server.M3u8Integration
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
+import eu.kanade.tachiyomi.animesource.model.Hoster
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
+import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.annotation.Source
 import keiyoushi.lib.dataimage.DataImageInterceptor
-import keiyoushi.utils.AnimeHttpLegacySource
+import keiyoushi.network.get
+import keiyoushi.network.post
+import keiyoushi.utils.jsonInstance
+import keiyoushi.utils.toJsonRequestBody
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
-import okhttp3.Interceptor
-import okhttp3.MediaType
+import okhttp3.CacheControl
 import okhttp3.Request
 import okhttp3.Response
-import okhttp3.ResponseBody
-import okio.Buffer
-import okio.ForwardingSource
-import okio.Source
-import okio.buffer
-import okio.cipherSource
-import java.io.FilterInputStream
-import java.io.IOException
-import java.io.InputStream
-import java.security.GeneralSecurityException
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import kotlin.math.max
+import kotlin.math.min
 
 private class CategoryFilter :
     AnimeFilter.Select<String>(
@@ -39,29 +36,52 @@ private class CategoryFilter :
     override fun toString() = arrayOf("", "/ai-duanju", "/ai-manju", "/ai-huanlian", "/ai-mogai")[state]
 }
 
-@Serializable
-private data class VideoInitialData(
-    val videoSrc: String = "",
-    val epPlaySrcs: Map<String, String> = emptyMap(),
-)
-
 private const val COVER_PLACEHOLDER = "https://huangguoai.com/static/web/images/cover-placeholder.png"
 private const val IMAGE_KEY = "f5d965df75336270"
 private const val IMAGE_IV = "97b60394abc2fbe1"
 
-class HuangguoAI : AnimeHttpLegacySource() {
-    override val baseUrl = "https://huangguoai.com"
-    override val lang = "zh"
-    override val name = "黄果AI"
+@Serializable
+private data class PlaybackRequest(val dummy: Unit = Unit)
+
+@Serializable
+private data class PlaybackResponse(
+    val status: Int,
+    val data: PlaybackData?,
+    val msg: String?,
+)
+
+@Serializable
+private data class PlaybackData(
+    val streams: Streams,
+    val cdn: CdnInfo,
+)
+
+@Serializable
+private data class Streams(
+    val main: String,
+    val preview: String?,
+    val hevc: String?,
+)
+
+@Serializable
+private data class CdnInfo(
+    val m3u8Enabled: Boolean,
+    val authKey: String,
+    val authValue: String,
+    val imgAuthKey: String,
+    val imgAuthValue: String,
+)
+
+@Source
+abstract class HuangguoAI : AnimeHttpSource() {
+
     override val supportsLatest = true
 
     override val client = network.client.newBuilder()
         .addInterceptor(DataImageInterceptor())
         .build()
 
-    private val json = Json { ignoreUnknownKeys = true }
-
-    override fun headersBuilder() = super.headersBuilder().add("referer", "$baseUrl/")
+    private val m3u8Integration by lazy { M3u8Integration(client) }
 
     override fun animeDetailsParse(response: Response): SAnime {
         val document = response.asJsoup()
@@ -94,12 +114,149 @@ class HuangguoAI : AnimeHttpLegacySource() {
         }
     }
 
-    override fun videoListParse(response: Response): List<Video> {
-        val data = response.asJsoup().selectFirst("#videoInitialData")?.data().orEmpty()
-        val initialData = json.decodeFromString<VideoInitialData>(data)
-        val videoUrl = initialData.videoSrc.ifBlank { initialData.epPlaySrcs.values.firstOrNull().orEmpty() }
-        return if (videoUrl.isBlank()) emptyList() else listOf(Video(videoUrl, "黄果AI", videoUrl))
+    // ============================ Video Links (Lib 16) ============================
+
+    override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
+        val episodeUrl = baseUrl + episode.url
+        val episodeHeaders = headers.newBuilder()
+            .set("Referer", "$baseUrl/")
+            .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+            .build()
+        val episodeResponse = client.get(episodeUrl, episodeHeaders, cacheControl = CacheControl.FORCE_NETWORK)
+        return episodeResponse.use { response ->
+            parseHosterList(response)
+        }
     }
+
+    private suspend fun parseHosterList(response: Response): List<Hoster> {
+        val document = response.asJsoup()
+        val episodePageUrl = response.request.url.toString()
+
+        // Extract video ID from the URL first (format: /video/12/ep-21/)
+        val videoId = extractVideoIdFromUrl(episodePageUrl) ?: run {
+            // Fallback: try extracting from page
+            val fromPage = extractVideoId(document)
+            if (fromPage == null) return emptyList()
+            fromPage
+        }
+
+        // Extract episode number from URL
+        // URL format: .../ep-21/ -> episode ID is 21
+        val episodeId = extractEpisodeId(episodePageUrl) ?: return emptyList()
+
+        // Call the playback API to get the m3u8 URL
+        val playbackUrl = "$baseUrl/api/videos/$videoId/episodes/$episodeId/playback"
+        val playbackRequest = PlaybackRequest()
+        val apiResponse = client.post(playbackUrl, playbackRequest.toJsonRequestBody())
+
+        return apiResponse.use { apiResponse ->
+            val bodyString = apiResponse.body.string()
+            val playbackResponse = jsonInstance.decodeFromString<PlaybackResponse>(bodyString)
+
+            if (playbackResponse.status == 1 && playbackResponse.data?.streams?.main?.isNotBlank() == true) {
+                val videoUrl = playbackResponse.data.streams.main
+                val cdn = playbackResponse.data.cdn
+                val internalData = buildString {
+                    append(videoUrl)
+                    append("|headers|")
+                    append(cdn.authKey.orEmpty())
+                    append("|")
+                    append(cdn.authValue.orEmpty())
+                }
+                listOf(
+                    Hoster(
+                        hosterUrl = episodePageUrl,
+                        hosterName = "黄果AI",
+                        internalData = internalData,
+                    ),
+                )
+            } else {
+                emptyList()
+            }
+        }
+    }
+
+    private fun extractVideoIdFromUrl(url: String): String? {
+        // URL format: https://huangguoai.com/video/12/ep-21/ -> video ID is 12
+        val match = Regex("/video/(\\d+)/ep-\\d+/").find(url)
+        return match?.groupValues?.get(1)
+    }
+
+    private fun extractVideoId(document: org.jsoup.nodes.Document): String? {
+        // Try to find video ID in various places
+        // 1. From data attributes on video element
+        val videoEl = document.selectFirst("video.hg-web-play__video")
+        val dataVideoId = videoEl?.attr("data-video-id") ?: videoEl?.attr("data-id")
+        if (dataVideoId?.isNotBlank() == true) return dataVideoId
+
+        // 2. From script tags (JSON data) - look for videoId specifically
+        val scripts = document.select("script")
+        for (script in scripts) {
+            val html = script.html()
+            if (html.isBlank()) continue
+            val videoIdMatch = Regex("\"videoId\"\\s*:\\s*[\"']?(\\d+)[\"']?").find(html)
+            if (videoIdMatch != null) return videoIdMatch.groupValues[1]
+        }
+
+        // 3. From generic "id" in script tags with video context
+        for (script in scripts) {
+            val html = script.html()
+            if (html.isBlank()) continue
+            val idMatch = Regex("\"id\"\\s*:\\s*[\"']?(\\d+)[\"']?").find(html)
+            if (idMatch != null) {
+                // Check if this looks like a video ID by context
+                val context = html.substring(max(0, idMatch.range.first - 50), min(html.length, idMatch.range.last + 50))
+                if (context.contains("video", ignoreCase = true)) return idMatch.groupValues[1]
+            }
+        }
+
+        return null
+    }
+
+    private fun extractEpisodeId(url: String): String? {
+        // URL pattern: /ep-21/ or /episodes/21/
+        val epMatch = Regex("/ep-(\\d+)/|/episodes/(\\d+)/").find(url)
+        return epMatch?.groupValues?.get(1) ?: epMatch?.groupValues?.get(2)
+    }
+
+    override suspend fun getVideoList(hoster: Hoster): List<Video> {
+        val internalData = hoster.internalData
+        return if (internalData.isBlank()) {
+            emptyList()
+        } else {
+            // Parse internalData format: videoUrl|headers|authKey|authValue
+            val parts = internalData.split("|headers|")
+            val videoUrl = parts[0]
+            val videoHeaders = headers.newBuilder()
+                .set("Referer", baseUrl)
+                .apply {
+                    if (parts.size > 1) {
+                        val headerParts = parts[1].split("|")
+                        if (headerParts.size == 2 && headerParts[0].isNotBlank() && headerParts[1].isNotBlank()) {
+                            set(headerParts[0], headerParts[1])
+                        }
+                    }
+                }
+                .build()
+            val videos = listOf(
+                Video(
+                    videoUrl = videoUrl,
+                    videoTitle = hoster.hosterName,
+                    headers = videoHeaders,
+                ),
+            )
+            // Process through m3u8 server if it's an HLS stream
+            return m3u8Integration.processVideoList(videos)
+        }
+    }
+
+    override fun hosterListParse(response: Response): List<Hoster> = throw UnsupportedOperationException()
+
+    override fun videoListParse(response: Response, hoster: Hoster): List<Video> = throw UnsupportedOperationException()
+
+    override fun seasonListParse(response: Response): List<SAnime> = throw UnsupportedOperationException()
+
+    // ============================ Lists ============================
 
     override fun latestUpdatesParse(response: Response) = parseAnimeList(response)
 
@@ -125,9 +282,9 @@ class HuangguoAI : AnimeHttpLegacySource() {
     }
 
     private fun decryptImage(imageUrl: String): String = runCatching {
-        val encrypted = client.newCall(GET(imageUrl, headers)).execute().use { response ->
-            response.body?.bytes() ?: return ""
-        }
+        val request = GET(imageUrl, headers)
+        val response = client.newCall(request).execute()
+        val encrypted = response.use { it.body.bytes() }
         val cipher = Cipher.getInstance("AES/CBC/NoPadding").apply {
             init(
                 Cipher.DECRYPT_MODE,
