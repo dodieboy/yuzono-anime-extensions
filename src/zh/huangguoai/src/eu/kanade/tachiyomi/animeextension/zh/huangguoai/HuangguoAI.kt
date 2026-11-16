@@ -119,16 +119,16 @@ abstract class HuangguoAI : AnimeHttpSource() {
     override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
         val episodeUrl = baseUrl + episode.url
         val episodeHeaders = headers.newBuilder()
-            .set("Referer", "$baseUrl/")
+            .set("Origin", "$baseUrl/")
             .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
             .build()
         val episodeResponse = client.get(episodeUrl, episodeHeaders, cacheControl = CacheControl.FORCE_NETWORK)
         return episodeResponse.use { response ->
-            parseHosterList(response)
+            parseHosterList(response, episode.episode_number.toInt().toString())
         }
     }
 
-    private suspend fun parseHosterList(response: Response): List<Hoster> {
+    private suspend fun parseHosterList(response: Response, episodeIdFallback: String): List<Hoster> {
         val document = response.asJsoup()
         val episodePageUrl = response.request.url.toString()
 
@@ -140,72 +140,99 @@ abstract class HuangguoAI : AnimeHttpSource() {
             fromPage
         }
 
-        // Extract episode number from URL
-        // URL format: .../ep-21/ -> episode ID is 21
-        val episodeId = extractEpisodeId(episodePageUrl) ?: return emptyList()
+        // Extract episode number from URL (/ep-21/) or fall back to the parsed episode_number
+        val episodeId = extractEpisodeId(episodePageUrl) ?: episodeIdFallback
 
-        // Call the playback API to get the m3u8 URL
-        val playbackUrl = "$baseUrl/api/videos/$videoId/episodes/$episodeId/playback"
+        // Call the playback API to get the m3u8 URL.
+        // The site may require Origin/Referer headers for CORS.
+        val apiHeaders = headers.newBuilder()
+            .set("Origin", baseUrl)
+            .set("Referer", episodePageUrl)
+            .set("Accept", "application/json, text/plain, */*")
+            .set("Content-Type", "application/json; charset=utf-8")
+            .build()
+
         val playbackRequest = PlaybackRequest()
-        val apiResponse = client.post(playbackUrl, playbackRequest.toJsonRequestBody())
 
-        return apiResponse.use { apiResponse ->
-            val bodyString = apiResponse.body.string()
-            val playbackResponse = jsonInstance.decodeFromString<PlaybackResponse>(bodyString)
+        // Try multiple API path patterns in case the site changed its URL structure
+        val apiPaths = listOf(
+            "$baseUrl/api/videos/$videoId/episodes/$episodeId/playback",
+            "$baseUrl/api/videos/$videoId/playback",
+        )
 
-            if (playbackResponse.status == 1 && playbackResponse.data?.streams?.main?.isNotBlank() == true) {
-                val videoUrl = playbackResponse.data.streams.main
-                val cdn = playbackResponse.data.cdn
-                val internalData = buildString {
-                    append(videoUrl)
-                    append("|headers|")
-                    append(cdn.authKey.orEmpty())
-                    append("|")
-                    append(cdn.authValue.orEmpty())
+        for (playbackUrl in apiPaths) {
+            try {
+                val apiResponse = client.post(playbackUrl, apiHeaders, playbackRequest.toJsonRequestBody())
+                val hosters = apiResponse.use { apiResponse ->
+                    val bodyString = apiResponse.body.string()
+                    val playbackResponse = jsonInstance.decodeFromString<PlaybackResponse>(bodyString)
+
+                    if (playbackResponse.status == 1 && playbackResponse.data?.streams?.main?.isNotBlank() == true) {
+                        val videoUrl = playbackResponse.data.streams.main
+                        val cdn = playbackResponse.data.cdn
+                        val internalData = buildString {
+                            append(videoUrl)
+                            append("|headers|")
+                            append(cdn.authKey.orEmpty())
+                            append("|")
+                            append(cdn.authValue.orEmpty())
+                        }
+                        listOf(
+                            Hoster(
+                                hosterUrl = episodePageUrl,
+                                hosterName = "黄果AI",
+                                internalData = internalData,
+                            ),
+                        )
+                    } else {
+                        emptyList()
+                    }
                 }
-                listOf(
-                    Hoster(
-                        hosterUrl = episodePageUrl,
-                        hosterName = "黄果AI",
-                        internalData = internalData,
-                    ),
-                )
-            } else {
-                emptyList()
+                if (hosters.isNotEmpty()) return hosters
+            } catch (e: Exception) {
+                // Try next API path
+                continue
             }
         }
+
+        return emptyList<Hoster>()
     }
 
     private fun extractVideoIdFromUrl(url: String): String? {
         // URL format: https://huangguoai.com/video/12/ep-21/ -> video ID is 12
-        val match = Regex("/video/(\\d+)/ep-\\d+/").find(url)
+        // First episode: https://huangguoai.com/video/12/ -> video ID is 12
+        val match = Regex("/video/(\\d+)(?:/ep-\\d+)?/").find(url)
         return match?.groupValues?.get(1)
     }
 
+    // Extract video ID from the page (fallback when URL parsing fails)
+// Tries multiple patterns to be robust against site changes
     private fun extractVideoId(document: org.jsoup.nodes.Document): String? {
-        // Try to find video ID in various places
-        // 1. From data attributes on video element
+        // Try multiple patterns in order of likelihood:
+        // 1. data-video-id / data-id attributes on video element
+        // 2. "videoId": in script tags
+        // 3. Any id in script tags near "video" context
+        val scripts = document.select("script")
+
+        // Check data attributes first
         val videoEl = document.selectFirst("video.hg-web-play__video")
         val dataVideoId = videoEl?.attr("data-video-id") ?: videoEl?.attr("data-id")
         if (dataVideoId?.isNotBlank() == true) return dataVideoId
 
+        // Collect all script HTML once
+        val scriptHtmls = scripts.map { it.html() }.filter { it.isNotBlank() }
+
         // 2. From script tags (JSON data) - look for videoId specifically
-        val scripts = document.select("script")
-        for (script in scripts) {
-            val html = script.html()
-            if (html.isBlank()) continue
+        for (html in scriptHtmls) {
             val videoIdMatch = Regex("\"videoId\"\\s*:\\s*[\"']?(\\d+)[\"']?").find(html)
             if (videoIdMatch != null) return videoIdMatch.groupValues[1]
         }
 
         // 3. From generic "id" in script tags with video context
-        for (script in scripts) {
-            val html = script.html()
-            if (html.isBlank()) continue
+        for (html in scriptHtmls) {
             val idMatch = Regex("\"id\"\\s*:\\s*[\"']?(\\d+)[\"']?").find(html)
             if (idMatch != null) {
-                // Check if this looks like a video ID by context
-                val context = html.substring(max(0, idMatch.range.first - 50), min(html.length, idMatch.range.last + 50))
+                val context = html.substring(max(0, idMatch.range.first - 80), min(html.length, idMatch.range.last + 80))
                 if (context.contains("video", ignoreCase = true)) return idMatch.groupValues[1]
             }
         }
@@ -214,9 +241,15 @@ abstract class HuangguoAI : AnimeHttpSource() {
     }
 
     private fun extractEpisodeId(url: String): String? {
-        // URL pattern: /ep-21/ or /episodes/21/
-        val epMatch = Regex("/ep-(\\d+)/|/episodes/(\\d+)/").find(url)
-        return epMatch?.groupValues?.get(1) ?: epMatch?.groupValues?.get(2)
+        // 1) Explicit episode segment: /ep-21/ or /episodes/21/
+        Regex("/(?:ep-|episodes/)(\\d+)(?:/|$)")
+            .find(url)?.let { return it.groupValues[1] }
+
+        // 2) Bare video URL (/video/7022/ or /video/7022) => first episode
+        if (Regex("/video/\\d+(?:/|$)").containsMatchIn(url)) return "1"
+
+        // 3) Anything else: unknown
+        return null
     }
 
     override suspend fun getVideoList(hoster: Hoster): List<Video> {
