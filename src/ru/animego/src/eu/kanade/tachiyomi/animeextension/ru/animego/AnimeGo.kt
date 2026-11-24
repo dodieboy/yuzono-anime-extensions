@@ -18,6 +18,7 @@ import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.annotation.Source
 import keiyoushi.utils.bodyString
 import keiyoushi.utils.get
 import keiyoushi.utils.getPreferencesLazy
@@ -35,13 +36,11 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
-class AnimeGo :
+@Source
+abstract class AnimeGo :
     AnimeHttpSource(),
     ConfigurableAnimeSource {
 
-    override val name = "AnimeGO.studio"
-    override val baseUrl = "https://animego.studio"
-    override val lang = "ru"
     override val supportsLatest = true
 
     private val preferences by getPreferencesLazy()
@@ -504,7 +503,7 @@ class AnimeGo :
                         hlsHeaders,
                     )
                 } else {
-                    listOf(Video(hlsUrl, "$dubbing (${qualityName}p Kodik)", hlsUrl, headers = hlsHeaders))
+                    listOf(Video(videoUrl = hlsUrl, videoTitle = "$dubbing (${qualityName}p Kodik)", headers = hlsHeaders))
                 }
             }
         }

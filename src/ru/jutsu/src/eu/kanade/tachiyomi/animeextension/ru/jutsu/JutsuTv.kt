@@ -18,6 +18,7 @@ import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.annotation.Source
 import keiyoushi.utils.bodyString
 import keiyoushi.utils.get
 import keiyoushi.utils.getPreferencesLazy
@@ -33,13 +34,11 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
-class JutsuTv :
+@Source
+abstract class JutsuTv :
     AnimeHttpSource(),
     ConfigurableAnimeSource {
 
-    override val name = "Jutsu TV"
-    override val baseUrl = "https://jutsu.tv"
-    override val lang = "ru"
     override val supportsLatest = true
 
     // The DLE search is a loose full-text match over posts, so a title query also drags in
@@ -586,10 +585,10 @@ class JutsuTv :
                         if (qualityName == "720" && kodikData.links.full.isEmpty()) {
                             val hlsUrl1080 = hlsUrl.replace("/720.mp4", "/1080.mp4")
                             if (hlsUrl1080 != hlsUrl && isUrlAvailable(hlsUrl1080, hlsHeaders)) {
-                                add(Video(hlsUrl1080, "$dubbing (1080p Kodik)", hlsUrl1080, headers = hlsHeaders))
+                                add(Video(videoUrl = hlsUrl1080, videoTitle = "$dubbing (1080p Kodik)", headers = hlsHeaders))
                             }
                         }
-                        add(Video(hlsUrl, "$dubbing (${qualityName}p Kodik)", hlsUrl, headers = hlsHeaders))
+                        add(Video(videoUrl = hlsUrl, videoTitle = "$dubbing (${qualityName}p Kodik)", headers = hlsHeaders))
                     }
                 }
             }

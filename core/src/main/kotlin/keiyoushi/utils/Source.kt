@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import android.os.Handler
 import android.os.Looper
 import android.widget.Toast
+import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.Hoster
@@ -15,6 +16,7 @@ import kotlinx.serialization.json.Json
 import okhttp3.Response
 import uy.kohesive.injekt.injectLazy
 
+@Deprecated("Use keiyoushi.source.AniSource, which runs on both Anikku and Animiru")
 abstract class Source :
     AnimeHttpSource(),
     ConfigurableAnimeSource {
@@ -24,7 +26,9 @@ abstract class Source :
 
     open val json: Json by injectLazy()
 
-    val preferences: SharedPreferences by getPreferencesLazy { migration }
+    // Invoked inside the lambda: passing `migration` itself would read it in this constructor,
+    // before a subclass has initialized its override
+    val preferences: SharedPreferences by getPreferencesLazy { migration() }
 
     protected val handler by lazy { Handler(Looper.getMainLooper()) }
 
@@ -33,6 +37,9 @@ abstract class Source :
             Toast.makeText(context, message, length).show()
         }
     }
+
+    // A concrete default, so code generated for a `source { }` mirror or custom URL can call super
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {}
 
     override fun popularAnimeRequest(page: Int) = throw UnsupportedOperationException()
     override fun popularAnimeParse(response: Response) = throw UnsupportedOperationException()

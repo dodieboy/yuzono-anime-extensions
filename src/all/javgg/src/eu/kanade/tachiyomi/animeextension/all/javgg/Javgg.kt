@@ -16,6 +16,7 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.annotation.Source
 import keiyoushi.utils.AnimeHttpLegacySource
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parallelCatchingFlatMapBlocking
@@ -25,15 +26,10 @@ import okhttp3.Response
 import java.text.SimpleDateFormat
 import java.util.Locale
 
-class Javgg :
+@Source
+abstract class Javgg :
     AnimeHttpLegacySource(),
     ConfigurableAnimeSource {
-
-    override val name = "JavGG"
-
-    override val baseUrl = "https://javgg.net"
-
-    override val lang = "all"
 
     override val supportsLatest = true
 
@@ -277,7 +273,7 @@ class Javgg :
                     add("Referer", "https://${turboDocument.location().toHttpUrl().host}/")
                 }.build()
 
-                listOf(Video(masterUrl, "TurboPlay", masterUrl, customHeaders))
+                listOf(Video(videoUrl = masterUrl, videoTitle = "TurboPlay", headers = customHeaders))
             }
 
             else -> emptyList()
