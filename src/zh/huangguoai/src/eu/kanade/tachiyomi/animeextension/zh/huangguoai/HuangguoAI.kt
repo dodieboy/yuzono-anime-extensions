@@ -1,6 +1,5 @@
 package eu.kanade.tachiyomi.animeextension.zh.huangguoai
 
-import android.util.Base64
 import aniyomi.lib.m3u8server.M3u8Integration
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -13,15 +12,17 @@ import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
-import keiyoushi.lib.dataimage.DataImageInterceptor
 import keiyoushi.network.get
 import keiyoushi.network.post
 import keiyoushi.utils.jsonInstance
 import keiyoushi.utils.toJsonRequestBody
 import kotlinx.serialization.Serializable
 import okhttp3.CacheControl
+import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -39,6 +40,10 @@ private class CategoryFilter :
 private const val COVER_PLACEHOLDER = "https://huangguoai.com/static/web/images/cover-placeholder.png"
 private const val IMAGE_KEY = "f5d965df75336270"
 private const val IMAGE_IV = "97b60394abc2fbe1"
+
+// Fragment marker appended to encrypted cover URLs so HuangguoImageInterceptor can identify them.
+// The interceptor strips the marker before making the real network request.
+private const val ENCRYPTED_COVER_MARKER = "#huangguo-encrypted"
 
 @Serializable
 private data class PlaybackRequest(val dummy: Unit = Unit)
@@ -72,13 +77,74 @@ private data class CdnInfo(
     val imgAuthValue: String,
 )
 
+/**
+ * Interceptor that decrypts HuangguoAI's encrypted cover images.
+ *
+ * Only handles requests explicitly marked with the [ENCRYPTED_COVER_MARKER] fragment. HTML, API,
+ * JSON, placeholder, and other image requests pass through untouched.
+ *
+ * For a marked request it:
+ *   1. Strips the fragment marker from the URL.
+ *   2. Proceeds with the cleaned request to fetch the encrypted image bytes.
+ *   3. Decrypts the body with AES/CBC/NoPadding using [IMAGE_KEY] and [IMAGE_IV].
+ *   4. Returns a synthetic response whose body is the decrypted image bytes with the appropriate
+ *      Content-Type so Coil can render it.
+ *
+ * On decryption failure it returns the original response so list loading is not broken.
+ */
+private class HuangguoImageInterceptor : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val url = request.url
+        if (url.fragment != "huangguo-encrypted") {
+            return chain.proceed(request)
+        }
+
+        val cleanedUrl = url.newBuilder().fragment(null).build()
+        val cleanedRequest = request.newBuilder().url(cleanedUrl).build()
+
+        return chain.proceed(cleanedRequest).use { originalResponse ->
+            val body = originalResponse.body
+            val encryptedBytes = body.bytes()
+
+            val decryptedBytes = try {
+                val cipher = Cipher.getInstance("AES/CBC/NoPadding").apply {
+                    init(
+                        Cipher.DECRYPT_MODE,
+                        SecretKeySpec(IMAGE_KEY.toByteArray(), "AES"),
+                        IvParameterSpec(IMAGE_IV.toByteArray()),
+                    )
+                }
+                cipher.doFinal(encryptedBytes)
+            } catch (e: Exception) {
+                return@use originalResponse
+            }
+
+            val path = url.encodedPath
+            val contentType = when {
+                path.endsWith(".jpg", ignoreCase = true) || path.endsWith(".jpeg", ignoreCase = true) -> "image/jpeg"
+                path.endsWith(".png", ignoreCase = true) -> "image/png"
+                path.endsWith(".webp", ignoreCase = true) -> "image/webp"
+                else -> "application/octet-stream"
+            }
+
+            originalResponse.newBuilder()
+                .removeHeader("Content-Length")
+                .removeHeader("Content-Encoding")
+                .header("Content-Type", contentType)
+                .body(decryptedBytes.toResponseBody(contentType.toMediaTypeOrNull()))
+                .build()
+        }
+    }
+}
+
 @Source
 abstract class HuangguoAI : AnimeHttpSource() {
 
     override val supportsLatest = true
 
     override val client = network.client.newBuilder()
-        .addInterceptor(DataImageInterceptor())
+        .addInterceptor(HuangguoImageInterceptor())
         .build()
 
     private val m3u8Integration by lazy { M3u8Integration(client) }
@@ -206,7 +272,7 @@ abstract class HuangguoAI : AnimeHttpSource() {
     }
 
     // Extract video ID from the page (fallback when URL parsing fails)
-// Tries multiple patterns to be robust against site changes
+    // Tries multiple patterns to be robust against site changes
     private fun extractVideoId(document: org.jsoup.nodes.Document): String? {
         // Try multiple patterns in order of likelihood:
         // 1. data-video-id / data-id attributes on video element
@@ -314,23 +380,6 @@ abstract class HuangguoAI : AnimeHttpSource() {
         return if (page == 1) "$baseUrl$normalizedPath/" else "$baseUrl$normalizedPath/$page/"
     }
 
-    private fun decryptImage(imageUrl: String): String = runCatching {
-        val request = GET(imageUrl, headers)
-        val response = client.newCall(request).execute()
-        val encrypted = response.use { it.body.bytes() }
-        val cipher = Cipher.getInstance("AES/CBC/NoPadding").apply {
-            init(
-                Cipher.DECRYPT_MODE,
-                SecretKeySpec(IMAGE_KEY.toByteArray(), "AES"),
-                IvParameterSpec(IMAGE_IV.toByteArray()),
-            )
-        }
-        val extension = imageUrl.substringBefore('?').substringAfterLast('.').lowercase().let {
-            if (it == "jpg") "jpeg" else it.ifBlank { "jpeg" }
-        }
-        "https://127.0.0.1/?image/$extension;base64,${Base64.encodeToString(cipher.doFinal(encrypted), Base64.NO_WRAP)}"
-    }.getOrDefault("")
-
     private fun parseAnimeList(response: Response): AnimesPage {
         val document = response.asJsoup()
         val items = document.select(".hg-list-page .hg-drama-card").mapNotNull { card ->
@@ -341,8 +390,9 @@ abstract class HuangguoAI : AnimeHttpSource() {
                     ?.ifBlank { card.selectFirst("h3.hg-drama-card__title a")?.text() }
                     .orEmpty()
                 thumbnail_url = card.selectFirst("img")?.let { image ->
-                    image.attr("abs:data-src").ifBlank { image.attr("data-src") }
-                }?.let(::decryptImage).orEmpty().ifBlank { COVER_PLACEHOLDER }
+                    val src = image.attr("abs:data-src").ifBlank { image.attr("data-src") }
+                    if (src.isBlank()) COVER_PLACEHOLDER else "$src$ENCRYPTED_COVER_MARKER"
+                } ?: COVER_PLACEHOLDER
             }
         }.distinctBy { it.url }
         return AnimesPage(items, document.select("a[title*=下一页]:not([disabled])").isNotEmpty())

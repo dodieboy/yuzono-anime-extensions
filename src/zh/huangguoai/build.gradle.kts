@@ -6,7 +6,7 @@ plugins {
 
 yuzono {
     name = "HuangguoAI"
-    versionCode = 2
+    versionCode = 3
     contentWarning = ContentWarning.NSFW
     libVersion = "16"
 
@@ -17,6 +17,5 @@ yuzono {
 }
 
 dependencies {
-    implementation(project(":lib:dataimage"))
     implementation(project(":lib:m3u8server"))
 }
