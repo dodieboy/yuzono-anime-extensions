@@ -125,7 +125,7 @@ abstract class Javgg :
 
         if (selectedTag.isNotBlank()) {
             val slug = slugMap[selectedTag]
-            if (!slug.isNullOrBlank()) return GET("$baseUrl/tag/$slug/page/$page/?view=today", headers)
+            if (!slug.isNullOrBlank()) return GET("$baseUrl/tag/$slug/page/$page", headers)
         }
 
         return when {
